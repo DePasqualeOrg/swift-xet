@@ -1,4 +1,3 @@
-import AsyncHTTPClient
 #if canImport(Darwin)
     import Darwin
 #elseif canImport(Glibc)
@@ -10,18 +9,9 @@ import Foundation
     import FoundationNetworking
 #endif
 
-import NIOConcurrencyHelpers
-import NIOCore
-import NIOHTTP1
-import NIOPosix
-#if canImport(NIOTransportServices)
-    import NIOTransportServices
-#endif
-
 /// Progress update for a single file download.
 ///
-/// Progress callbacks are delivered sequentially in the order bytes are written.
-/// The handler is called on the same task context as the download method.
+/// Progress callbacks may arrive concurrently from multiple threads.
 /// To update UI, dispatch to the main actor within your handler.
 public struct DownloadProgress: Sendable, Equatable {
     /// Total expected bytes (decompressed).
@@ -68,7 +58,7 @@ public struct DownloadProgress: Sendable, Equatable {
 /// The downloader handles chunk-level alignment automatically,
 /// skipping bytes at the start and truncating at the end as needed.
 public enum Xet {
-    /// Creates a downloader for the duration of the closure, then shuts it down.
+    /// Creates a downloader for the duration of the closure.
     public static func withDownloader<T>(
         refreshURL: URL,
         hubToken: String? = nil,
@@ -80,14 +70,8 @@ public enum Xet {
             hubToken: hubToken,
             configuration: configuration
         )
-        do {
-            let result = try await body(downloader)
-            try await downloader.shutdown()
-            return result
-        } catch {
-            try? await downloader.shutdown()
-            throw error
-        }
+        defer { downloader.invalidate() }
+        return try await body(downloader)
     }
 }
 
@@ -95,8 +79,6 @@ public enum Xet {
 ///
 /// Use ``Xet/withDownloader(refreshURL:hubToken:configuration:_:)``
 /// to create a downloader with a scoped lifetime.
-/// If you instantiate directly,
-/// call ``shutdown()`` when you are done to release HTTP client resources.
 public final class XetDownloader: @unchecked Sendable {
     /// Hub token refresh endpoint for CAS credentials.
     private let refreshURL: URL
@@ -110,8 +92,11 @@ public final class XetDownloader: @unchecked Sendable {
     /// Client for CAS reconstruction metadata requests.
     private let casClient: CASClient
 
-    /// Pool of HTTP clients for xorb fetches.
-    private let httpClientPool: HTTPClientPool
+    /// Delegate for xorb data tasks that tracks download progress.
+    private let fetchDelegate: FetchDelegate
+
+    /// URL session for xorb data fetches, using the fetch delegate.
+    private let urlSession: URLSession
 
     /// Downloader configuration settings.
     private let configuration: Configuration
@@ -128,40 +113,8 @@ public final class XetDownloader: @unchecked Sendable {
             ProcessInfo.processInfo.activeProcessorCount
         )
 
-        /// Maximum number of decoded buffers held in memory. Defaults to 16.
-        public var maxInflightBuffers: Int = 16
-
-        /// Maximum concurrent HTTP/1 connections per host. Defaults to 24.
-        public var connectionsPerHost: Int = 24
-
-        /// Number of prewarmed HTTP/1 connections per host. Defaults to 16.
-        public var prewarmedConnections: Int = 16
-
-        /// Number of HTTP clients in the pool. Defaults to 4.
-        public var poolSize: Int = 4
-
-        /// Connection timeout for HTTP requests, in seconds. Defaults to 60.
-        public var connectTimeout: TimeInterval = 60
-
-        /// Read timeout for HTTP requests, in seconds. Defaults to 120.
-        public var readTimeout: TimeInterval = 120
-
-        /// Whether to scale fetch concurrency based on connection pool size.
-        /// Defaults to true.
-        public var autoScaleFetchConcurrency: Bool = true
-
-        /// Whether to wait for network connectivity before failing.
-        /// Defaults to true.
-        public var waitsForConnectivity: Bool = true
-
-        /// Idle timeout for pooled connections, in seconds. Defaults to 120.
-        public var idleTimeout: TimeInterval = 120
-
-        /// Whether to enable multipath connections. Defaults to true.
-        ///
-        /// Some environments or network stacks may not support multipath and can
-        /// surface "Operation unsupported" connection failures if enabled.
-        public var enableMultipath: Bool = true
+        /// Request timeout for HTTP requests, in seconds. Defaults to 120.
+        public var requestTimeout: TimeInterval = 120
 
         /// Whether to allow insecure (non-HTTPS) connections.
         ///
@@ -196,61 +149,27 @@ public final class XetDownloader: @unchecked Sendable {
             urlSession: .shared
         )
         self.casClient = CASClient(urlSession: .shared)
-        #if canImport(NIOTransportServices)
-            let effectiveEnableMultipath = configuration.enableMultipath
-        #else
-            let effectiveEnableMultipath = false
-        #endif
-        var httpConfiguration = HTTPClient.Configuration()
-        httpConfiguration.httpVersion = .http1Only
-        httpConfiguration.timeout = .init(
-            connect: .seconds(Int64(configuration.connectTimeout)),
-            read: .seconds(Int64(configuration.readTimeout))
-        )
-        httpConfiguration.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = max(
-            1,
-            configuration.connectionsPerHost
-        )
-        httpConfiguration.connectionPool.idleTimeout = .seconds(Int64(max(1, configuration.idleTimeout)))
-        httpConfiguration.connectionPool.preWarmedHTTP1ConnectionCount = max(
-            0,
-            min(configuration.prewarmedConnections, configuration.connectionsPerHost)
-        )
-        httpConfiguration.networkFrameworkWaitForConnectivity = configuration.waitsForConnectivity
-        httpConfiguration.enableMultipath = effectiveEnableMultipath
-        self.httpClientPool = HTTPClientPool(
-            configuration: httpConfiguration,
-            size: configuration.poolSize
+        self.fetchDelegate = FetchDelegate()
+        let sessionConfig = URLSessionConfiguration.default
+        sessionConfig.timeoutIntervalForRequest = configuration.requestTimeout
+        sessionConfig.httpMaximumConnectionsPerHost = 24
+        self.urlSession = URLSession(
+            configuration: sessionConfig,
+            delegate: fetchDelegate,
+            delegateQueue: nil
         )
     }
 
-    /// Best-effort fallback cleanup.
+    /// Invalidates the URL session, breaking the retain cycle with the delegate.
     ///
-    /// Callers should explicitly shut down the downloader
-    /// (for example, via `Xet.withDownloader` or by invoking `shutdown()`)
-    /// to ensure deterministic resource cleanup.
-    /// This `deinit` only attempts to
-    /// shut down the underlying HTTP client pool and event loop group.
-    /// The `alreadyShutdown` error is silently ignored since it's expected
-    /// when shutdown was already called explicitly; other errors are logged.
+    /// Called automatically by ``Xet/withDownloader(refreshURL:hubToken:configuration:_:)``.
+    /// If you create a downloader directly, call this when you are done.
+    public func invalidate() {
+        urlSession.invalidateAndCancel()
+    }
+
     deinit {
-        let pool = httpClientPool
-        Task.detached {
-            do {
-                try await pool.shutdown()
-            } catch {
-                switch error as? HTTPClientError {
-                case .alreadyShutdown:
-                    break
-                default:
-                    if let data = "XetDownloader deinit: failed to shutdown HTTP client pool: \(error)\n".data(
-                        using: .utf8
-                    ) {
-                        FileHandle.standardError.write(data)
-                    }
-                }
-            }
-        }
+        urlSession.invalidateAndCancel()
     }
 
     /// Downloads a file and returns its contents as `Data`.
@@ -351,15 +270,6 @@ public final class XetDownloader: @unchecked Sendable {
             })
             throw error
         }
-    }
-
-    /// Shuts down the internal HTTP client pool.
-    ///
-    /// Call this when you are done with the downloader to release resources.
-    ///
-    /// - SeeAlso: ``Xet/withDownloader(refreshURL:hubToken:configuration:_:)`` for a more convenient way to create and use a downloader.
-    public func shutdown() async throws {
-        try await httpClientPool.shutdown()
     }
 
     // MARK: - Progress
@@ -482,18 +392,15 @@ public final class XetDownloader: @unchecked Sendable {
 
         var totalWritten: Int64 = 0
         var writeOffset: Int64 = 0
-        let effectiveMaxConcurrentFetches = max(1, configuration.maxConcurrentFetches)
-        let maxConcurrentFetches: Int
-        if configuration.autoScaleFetchConcurrency {
-            let poolSize = max(1, configuration.poolSize)
-            let target = poolSize * max(1, configuration.connectionsPerHost)
-            maxConcurrentFetches = max(effectiveMaxConcurrentFetches, target)
-        } else {
-            maxConcurrentFetches = effectiveMaxConcurrentFetches
-        }
+        let maxConcurrentFetches = max(1, configuration.maxConcurrentFetches)
         let fetchSemaphore = AsyncSemaphore(maxConcurrentTasks: maxConcurrentFetches)
         var inflightFetches: [FetchRangeKey: Task<FetchedXorb, Error>] = [:]
         let writeRaw = target.writeContentsOf
+
+        let progressAggregator = DownloadProgressAggregator(
+            totalExpectedBytes: totalExpectedBytes,
+            handler: progressHandler
+        )
 
         func termRange(from fetched: FetchedXorb, for term: CASClient.ReconstructionResponse.Term) throws -> Range<Int>
         {
@@ -556,7 +463,7 @@ public final class XetDownloader: @unchecked Sendable {
             }
 
             totalWritten += Int64(upper - lower)
-            progressHandler?(DownloadProgress(totalBytes: totalExpectedBytes, bytesWritten: totalWritten))
+            progressAggregator.setWrittenBytes(totalWritten)
         }
 
         func ensureFetchTask(for context: TermContext) {
@@ -572,6 +479,8 @@ public final class XetDownloader: @unchecked Sendable {
                 return
             }
 
+            let decompressedContribution = Int64(expectedUnpackedLength ?? 0)
+
             inflightFetches[key] = Task {
                 await fetchSemaphore.wait()
                 do {
@@ -579,11 +488,23 @@ public final class XetDownloader: @unchecked Sendable {
                         termHash: term.hash,
                         fetchInfo: context.fetchInfo,
                         request: context.request,
-                        expectedUnpackedLength: expectedUnpackedLength
+                        expectedUnpackedLength: expectedUnpackedLength,
+                        downloadProgressHandler: { bytesReceived, bytesExpected in
+                            let fraction = bytesExpected > 0
+                                ? Double(bytesReceived) / Double(bytesExpected)
+                                : 0
+                            let estimated = Int64(Double(decompressedContribution) * fraction)
+                            progressAggregator.setFetchEstimate(
+                                key: key,
+                                estimatedBytes: estimated
+                            )
+                        }
                     )
+                    progressAggregator.removeFetchEstimate(key: key)
                     await fetchSemaphore.signal()
                     return fetched
                 } catch {
+                    progressAggregator.removeFetchEstimate(key: key)
                     await fetchSemaphore.signal()
                     throw error
                 }
@@ -624,7 +545,7 @@ public final class XetDownloader: @unchecked Sendable {
         }
 
         // Guarantee a final completion callback.
-        progressHandler?(DownloadProgress(totalBytes: totalExpectedBytes, bytesWritten: totalWritten))
+        progressAggregator.setWrittenBytes(totalExpectedBytes)
 
         return totalWritten
     }
@@ -633,57 +554,26 @@ public final class XetDownloader: @unchecked Sendable {
         termHash: String,
         fetchInfo: CASClient.ReconstructionResponse.FetchInfo,
         request: URLRequest,
-        expectedUnpackedLength: Int?
+        expectedUnpackedLength: Int?,
+        downloadProgressHandler: (@Sendable (Int64, Int64) -> Void)? = nil
     ) async throws -> FetchedXorb {
         guard let url = request.url else {
             throw XetDownloaderError.fetchFailed(statusCode: nil, url: URL(fileURLWithPath: "/"))
         }
-        let client = await httpClientPool.nextClient()
-        var httpRequest = HTTPClientRequest(url: url.absoluteString)
-        httpRequest.method = .GET
-        if let headers = request.allHTTPHeaderFields {
-            for (name, value) in headers {
-                httpRequest.headers.add(name: name, value: value)
-            }
-        }
-        let response = try await client.execute(
-            httpRequest,
-            timeout: .seconds(Int64(max(1, configuration.readTimeout)))
+        let (responseData, response) = try await fetchDelegate.data(
+            for: request,
+            session: urlSession,
+            progressHandler: downloadProgressHandler
         )
-        let statusCode = Int(response.status.code)
-        guard (200 ..< 300).contains(statusCode) || statusCode == 206 else {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw XetDownloaderError.fetchFailed(statusCode: nil, url: url)
+        }
+        let statusCode = httpResponse.statusCode
+        guard (200 ..< 300).contains(statusCode) else {
             throw XetDownloaderError.fetchFailed(statusCode: statusCode, url: url)
         }
-        let bufferSlots = max(
-            2,
-            min(
-                max(1, configuration.maxInflightBuffers),
-                max(1, configuration.maxConcurrentDecodes)
-            )
-        )
-        let bufferSemaphore = AsyncSemaphore(maxConcurrentTasks: bufferSlots)
-        let stream = AsyncThrowingStream<ByteBuffer, Error> { continuation in
-            let task = Task {
-                do {
-                    for try await buffer in response.body {
-                        if buffer.readableBytes == 0 {
-                            continue
-                        }
-                        await bufferSemaphore.wait()
-                        continuation.yield(buffer)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in
-                task.cancel()
-            }
-        }
-        let decoded = try await decodeXorbStream(
-            stream: stream,
-            bufferSemaphore: bufferSemaphore,
+        let decoded = try decodeXorbData(
+            responseData,
             expectedUnpackedLength: expectedUnpackedLength
         )
         return FetchedXorb(
@@ -693,15 +583,13 @@ public final class XetDownloader: @unchecked Sendable {
         )
     }
 
-    private func decodeXorbStream(
-        stream: AsyncThrowingStream<ByteBuffer, Error>,
-        bufferSemaphore: AsyncSemaphore,
+    private func decodeXorbData(
+        _ responseData: Data,
         expectedUnpackedLength: Int?
-    ) async throws -> (data: Data, chunkByteIndices: [Int]) {
+    ) throws -> (data: Data, chunkByteIndices: [Int]) {
         if let expectedUnpackedLength, expectedUnpackedLength > 0 {
-            return try await decodeXorbStreamPreallocated(
-                stream: stream,
-                bufferSemaphore: bufferSemaphore,
+            return try decodeXorbDataPreallocated(
+                responseData,
                 totalOutputSize: expectedUnpackedLength
             )
         }
@@ -710,42 +598,27 @@ public final class XetDownloader: @unchecked Sendable {
         var data = Data()
         var chunkByteIndices: [Int] = [0]
 
-        func drainCursor(isEOF: Bool) throws {
-            while true {
-                if let uncompressed = try Xorb.decodeNextChunk(from: &cursor) {
-                    data.append(uncompressed)
-                    chunkByteIndices.append(data.count)
-                    continue
-                }
-                if isEOF {
-                    if cursor.count == 0 {
-                        return
-                    }
-                    throw XorbError.truncatedStream
-                }
+        cursor.append(responseData)
+
+        while true {
+            if let uncompressed = try Xorb.decodeNextChunk(from: &cursor) {
+                data.append(uncompressed)
+                chunkByteIndices.append(data.count)
+                continue
+            }
+            if cursor.count == 0 {
                 break
             }
+            throw XorbError.truncatedStream
         }
 
-        for try await buffer in stream {
-            if buffer.readableBytes > 0 {
-                buffer.withUnsafeReadableBytes { raw in
-                    cursor.append(raw)
-                }
-            }
-            await bufferSemaphore.signal()
-            try drainCursor(isEOF: false)
-        }
-
-        try drainCursor(isEOF: true)
         return (data: data, chunkByteIndices: chunkByteIndices)
     }
 
-    private func decodeXorbStreamPreallocated(
-        stream: AsyncThrowingStream<ByteBuffer, Error>,
-        bufferSemaphore: AsyncSemaphore,
+    private func decodeXorbDataPreallocated(
+        _ responseData: Data,
         totalOutputSize: Int
-    ) async throws -> (data: Data, chunkByteIndices: [Int]) {
+    ) throws -> (data: Data, chunkByteIndices: [Int]) {
         let outputBuffer = UnsafeMutableRawPointer.allocate(
             byteCount: totalOutputSize,
             alignment: 16
@@ -760,78 +633,73 @@ public final class XetDownloader: @unchecked Sendable {
         chunkByteIndices.reserveCapacity(1024)
         var writeOffset = 0
 
-        do {
-            for try await buffer in stream {
-                if buffer.readableBytes > 0 {
-                    buffer.withUnsafeReadableBytes { raw in
-                        cursor.append(raw)
+        cursor.append(responseData)
+
+        while cursor.count >= 8 {
+            guard let headerBytes = cursor.peek(count: 8) else { break }
+            let header = try headerBytes.withUnsafeBytes { try Xorb.parseHeader($0) }
+            let totalLength = 8 + header.compressedLength
+
+            guard cursor.count >= totalLength else { break }
+
+            _ = cursor.skip(count: 8)
+            guard writeOffset + header.uncompressedLength <= totalOutputSize else {
+                throw XorbError.lengthMismatch(
+                    expected: totalOutputSize,
+                    actual: writeOffset + header.uncompressedLength
+                )
+            }
+            let outputSlice = UnsafeMutableRawBufferPointer(
+                start: outputBuffer.advanced(by: writeOffset),
+                count: header.uncompressedLength
+            )
+
+            try cursor.withUnsafeReadableBytes { readable in
+                let compressed = UnsafeRawBufferPointer(
+                    start: readable.baseAddress,
+                    count: header.compressedLength
+                )
+                switch header.compressionScheme {
+                case .none:
+                    guard header.compressedLength == header.uncompressedLength else {
+                        throw XorbError.lengthMismatch(
+                            expected: header.uncompressedLength,
+                            actual: header.compressedLength
+                        )
                     }
-                }
-                await bufferSemaphore.signal()
+                    if let src = compressed.baseAddress, let dst = outputSlice.baseAddress {
+                        memcpy(dst, src, header.compressedLength)
+                    }
 
-                while cursor.count >= 8 {
-                    guard let headerBytes = cursor.peek(count: 8) else { break }
-                    let header = try headerBytes.withUnsafeBytes { try Xorb.parseHeader($0) }
-                    let totalLength = 8 + header.compressedLength
-
-                    guard cursor.count >= totalLength else { break }
-
-                    _ = cursor.skip(count: 8)
-                    let outputSlice = UnsafeMutableRawBufferPointer(
-                        start: outputBuffer.advanced(by: writeOffset),
-                        count: header.uncompressedLength
+                case .lz4:
+                    _ = try LZ4.decompressBlock(
+                        compressed,
+                        uncompressedLength: header.uncompressedLength,
+                        output: outputSlice
                     )
 
-                    try cursor.withUnsafeReadableBytes { readable in
-                        let compressed = UnsafeRawBufferPointer(
-                            start: readable.baseAddress,
-                            count: header.compressedLength
-                        )
-                        switch header.compressionScheme {
-                        case .none:
-                            guard header.compressedLength == header.uncompressedLength else {
-                                throw XorbError.lengthMismatch(
-                                    expected: header.uncompressedLength,
-                                    actual: header.compressedLength
-                                )
-                            }
-                            if let src = compressed.baseAddress, let dst = outputSlice.baseAddress {
-                                memcpy(dst, src, header.compressedLength)
-                            }
-
-                        case .lz4:
-                            _ = try LZ4.decompressBlock(
-                                compressed,
-                                uncompressedLength: header.uncompressedLength,
-                                output: outputSlice
-                            )
-
-                        case .byteGrouping4LZ4:
-                            let scratch = UnsafeMutableRawBufferPointer.allocate(
-                                byteCount: header.uncompressedLength,
-                                alignment: 16
-                            )
-                            defer { scratch.deallocate() }
-                            _ = try LZ4.decompressBlock(
-                                compressed,
-                                uncompressedLength: header.uncompressedLength,
-                                output: scratch
-                            )
-                            BG4.regroup(UnsafeRawBufferPointer(scratch), into: outputSlice)
-                        }
-                    }
-
-                    cursor.consume(count: header.compressedLength)
-                    writeOffset += header.uncompressedLength
-                    chunkByteIndices.append(writeOffset)
+                case .byteGrouping4LZ4:
+                    let scratch = UnsafeMutableRawBufferPointer.allocate(
+                        byteCount: header.uncompressedLength,
+                        alignment: 16
+                    )
+                    defer { scratch.deallocate() }
+                    _ = try LZ4.decompressBlock(
+                        compressed,
+                        uncompressedLength: header.uncompressedLength,
+                        output: scratch
+                    )
+                    BG4.regroup(UnsafeRawBufferPointer(scratch), into: outputSlice)
                 }
             }
 
-            if cursor.count > 0 {
-                throw XorbError.truncatedStream
-            }
-        } catch {
-            throw error
+            cursor.consume(count: header.compressedLength)
+            writeOffset += header.uncompressedLength
+            chunkByteIndices.append(writeOffset)
+        }
+
+        if cursor.count > 0 {
+            throw XorbError.truncatedStream
         }
 
         let data = Data(
@@ -885,71 +753,172 @@ private actor AsyncSemaphore {
     }
 }
 
-/// Round-robin pool of HTTP clients.
-private actor HTTPClientPool {
-    /// Shared HTTP client instances.
-    private let clients: [HTTPClient]
-    /// Shared event loop group for all clients.
-    private let eventLoopGroup: EventLoopGroup
-    /// Next client index for round-robin selection.
-    private var nextIndex = 0
+// MARK: - Fetch Delegate
 
-    /// Creates a pool with the specified size.
-    init(configuration: HTTPClient.Configuration, size: Int) {
-        let poolSize = max(1, size)
-        var created: [HTTPClient] = []
-        created.reserveCapacity(poolSize)
-        let group: EventLoopGroup
-        #if canImport(NIOTransportServices) && !os(Linux)
-            if configuration.enableMultipath {
-                group = NIOTSEventLoopGroup(loopCount: System.coreCount)
-            } else {
-                group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-            }
-        #else
-            group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-        #endif
-        for _ in 0 ..< poolSize {
-            created.append(
-                HTTPClient(
-                    eventLoopGroupProvider: .shared(group),
-                    configuration: configuration
-                )
-            )
-        }
-        self.clients = created
-        self.eventLoopGroup = group
+/// URLSession data delegate that accumulates received data per task
+/// and reports download progress as bytes arrive.
+private final class FetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+
+    private struct TaskState {
+        var data: Data
+        var continuation: CheckedContinuation<(Data, URLResponse), Error>
+        var progressHandler: (@Sendable (Int64, Int64) -> Void)?
+        var response: URLResponse?
     }
 
-    /// Returns the next client in the pool.
-    func nextClient() -> HTTPClient {
-        let client = clients[nextIndex]
-        nextIndex = (nextIndex + 1) % clients.count
-        return client
+    private var taskStates: [Int: TaskState] = [:]
+
+    /// Performs a data request using the callback-based API so that the
+    /// delegate receives `didReceive data:` callbacks for progress tracking.
+    func data(
+        for request: URLRequest,
+        session: URLSession,
+        progressHandler: (@Sendable (Int64, Int64) -> Void)? = nil
+    ) async throws -> (Data, URLResponse) {
+        let taskHolder = TaskHolder()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let task = session.dataTask(with: request)
+                taskHolder.setTask(task)
+                lock.withLock {
+                    taskStates[task.taskIdentifier] = TaskState(
+                        data: Data(),
+                        continuation: continuation,
+                        progressHandler: progressHandler,
+                        response: nil
+                    )
+                }
+                if Task.isCancelled {
+                    task.cancel()
+                }
+                task.resume()
+            }
+        } onCancel: {
+            taskHolder.cancel()
+        }
     }
 
-    /// Shuts down all clients in the pool.
-    func shutdown() async throws {
-        for client in clients {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                client.shutdown(queue: .global()) { error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume()
-                    }
-                }
-            }
+    /// Thread-safe holder for a URLSessionTask, used to propagate
+    /// Swift task cancellation to the underlying network request.
+    private final class TaskHolder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var task: URLSessionDataTask?
+
+        func setTask(_ task: URLSessionDataTask) {
+            lock.lock()
+            self.task = task
+            lock.unlock()
         }
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            eventLoopGroup.shutdownGracefully { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            }
+
+        func cancel() {
+            lock.lock()
+            let task = self.task
+            lock.unlock()
+            task?.cancel()
         }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
+    ) {
+        lock.withLock {
+            taskStates[dataTask.taskIdentifier]?.response = response
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive receivedData: Data
+    ) {
+        let bytesExpected = dataTask.countOfBytesExpectedToReceive
+        let id = dataTask.taskIdentifier
+
+        lock.lock()
+        taskStates[id]?.data.append(receivedData)
+        let handler = taskStates[id]?.progressHandler
+        let bytesReceived = Int64(taskStates[id]?.data.count ?? 0)
+        lock.unlock()
+
+        handler?(bytesReceived, bytesExpected)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        let state: TaskState? = lock.withLock {
+            taskStates.removeValue(forKey: task.taskIdentifier)
+        }
+        guard let state else { return }
+        if let error {
+            state.continuation.resume(throwing: error)
+        } else if let response = state.response {
+            state.continuation.resume(returning: (state.data, response))
+        } else {
+            state.continuation.resume(throwing: URLError(.badServerResponse))
+        }
+    }
+}
+
+// MARK: - Download Progress Aggregator
+
+/// Aggregates per-fetch network progress estimates with written bytes
+/// to provide smooth overall download progress.
+private final class DownloadProgressAggregator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var writtenBytes: Int64 = 0
+    private var highWaterMark: Int64 = 0
+    private var fetchEstimates: [FetchRangeKey: Int64] = [:]
+    private let totalExpectedBytes: Int64
+    private let handler: (@Sendable (DownloadProgress) -> Void)?
+
+    init(
+        totalExpectedBytes: Int64,
+        handler: (@Sendable (DownloadProgress) -> Void)?
+    ) {
+        self.totalExpectedBytes = totalExpectedBytes
+        self.handler = handler
+    }
+
+    func setWrittenBytes(_ bytes: Int64) {
+        guard let handler else { return }
+        let progress: DownloadProgress = lock.withLock {
+            writtenBytes = bytes
+            return computeProgress()
+        }
+        handler(progress)
+    }
+
+    func setFetchEstimate(key: FetchRangeKey, estimatedBytes: Int64) {
+        guard let handler else { return }
+        let progress: DownloadProgress = lock.withLock {
+            fetchEstimates[key] = estimatedBytes
+            return computeProgress()
+        }
+        handler(progress)
+    }
+
+    func removeFetchEstimate(key: FetchRangeKey) {
+        lock.lock()
+        fetchEstimates.removeValue(forKey: key)
+        lock.unlock()
+    }
+
+    private func computeProgress() -> DownloadProgress {
+        let fetchContribution = fetchEstimates.values.reduce(Int64(0), +)
+        let estimated = min(writtenBytes + fetchContribution, totalExpectedBytes)
+        highWaterMark = max(highWaterMark, estimated)
+        return DownloadProgress(
+            totalBytes: totalExpectedBytes,
+            bytesWritten: highWaterMark
+        )
     }
 }
 
@@ -1235,7 +1204,7 @@ actor DataOutputWriter {
 
 /// A random access output writer backed by POSIX pwrite.
 final class FileOutputWriter: @unchecked Sendable {
-    private let lock = NIOLock()
+    private let lock = NSLock()
     private var fd: Int32
     private var sequentialOffset: Int64 = 0
 
