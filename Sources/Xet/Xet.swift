@@ -8,6 +8,9 @@ import Foundation
 #if canImport(FoundationNetworking)
     import FoundationNetworking
 #endif
+#if canImport(os)
+    import os
+#endif
 
 /// Progress update for a single file download.
 ///
@@ -101,6 +104,13 @@ public final class XetDownloader: @unchecked Sendable {
     /// Downloader configuration settings.
     private let configuration: Configuration
 
+    #if canImport(os)
+        private static let logger = Logger(
+            subsystem: "com.huggingface.xet",
+            category: "XetDownloader"
+        )
+    #endif
+
     /// Configuration for tuning downloader performance.
     public struct Configuration: Sendable {
         /// Maximum number of xorb fetches running at once. Defaults to 128.
@@ -115,6 +125,21 @@ public final class XetDownloader: @unchecked Sendable {
 
         /// Request timeout for HTTP requests, in seconds. Defaults to 120.
         public var requestTimeout: TimeInterval = 120
+
+        /// Maximum number of attempts per xorb fetch, including the initial
+        /// attempt. Set to 1 to disable retries. Defaults to 5.
+        ///
+        /// The Rust xet-core `retry_max_attempts` counts only retries (not the
+        /// initial attempt), so Rust's default of 5 allows 6 total attempts.
+        public var maxRetryAttempts: Int = 5
+
+        /// Base delay between retry attempts, in seconds. Defaults to 3.
+        /// Actual delay uses exponential backoff with jitter.
+        public var retryBaseDelay: TimeInterval = 3
+
+        /// Maximum total time to spend retrying a single fetch, in seconds.
+        /// Defaults to 360 (6 minutes).
+        public var retryMaxDuration: TimeInterval = 360
 
         /// Whether to allow insecure (non-HTTPS) connections.
         ///
@@ -560,27 +585,97 @@ public final class XetDownloader: @unchecked Sendable {
         guard let url = request.url else {
             throw XetDownloaderError.fetchFailed(statusCode: nil, url: URL(fileURLWithPath: "/"))
         }
-        let (responseData, response) = try await fetchDelegate.data(
-            for: request,
-            session: urlSession,
-            progressHandler: downloadProgressHandler
-        )
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw XetDownloaderError.fetchFailed(statusCode: nil, url: url)
+        let maxAttempts = max(1, configuration.maxRetryAttempts)
+        var delay = configuration.retryBaseDelay
+        // Enforce a maximum retry duration as an additional safeguard.
+        // The Rust implementation defines this config but does not use it;
+        // retries there are bounded only by max attempts.
+        let deadline = ContinuousClock.now + .seconds(configuration.retryMaxDuration)
+        var lastError: Error?
+
+        for attempt in 0 ..< maxAttempts {
+            if attempt > 0 {
+                let remaining = deadline - .now
+                if remaining <= .zero {
+                    break
+                }
+                // Exponential backoff (delay doubles each attempt) with jitter
+                // in [0, delay]. The jitter matches Rust's tokio_retry; the
+                // doubling differs from Rust's base^n to keep delays practical.
+                let jittered = Duration.seconds(delay * Double.random(in: 0.0 ... 1.0))
+                try await Task.sleep(for: min(jittered, remaining))
+                delay *= 2
+            }
+
+            do {
+                let (responseData, response) = try await fetchDelegate.data(
+                    for: request,
+                    session: urlSession,
+                    progressHandler: downloadProgressHandler
+                )
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    // A missing HTTP response typically indicates a fundamental
+                    // URL loading issue, not a transient network error.
+                    throw XetDownloaderError.fetchFailed(statusCode: nil, url: url)
+                }
+                let statusCode = httpResponse.statusCode
+                guard (200 ..< 300).contains(statusCode) else {
+                    throw XetDownloaderError.fetchFailed(statusCode: statusCode, url: url)
+                }
+                let decoded = try decodeXorbData(
+                    responseData,
+                    expectedUnpackedLength: expectedUnpackedLength
+                )
+                return FetchedXorb(
+                    data: decoded.data,
+                    chunkByteIndices: decoded.chunkByteIndices,
+                    chunkRange: fetchInfo.range
+                )
+            } catch {
+                guard Self.isRetryable(error) else {
+                    throw error
+                }
+                lastError = error
+                #if canImport(os)
+                    Self.logger.warning(
+                        "Retryable error on attempt \(attempt + 1)/\(maxAttempts) for \(url.lastPathComponent): \(error.localizedDescription)"
+                    )
+                #endif
+            }
         }
-        let statusCode = httpResponse.statusCode
-        guard (200 ..< 300).contains(statusCode) else {
-            throw XetDownloaderError.fetchFailed(statusCode: statusCode, url: url)
+
+        throw lastError ?? XetDownloaderError.fetchFailed(statusCode: nil, url: url)
+    }
+
+    /// Whether an error from a xorb fetch is worth retrying.
+    static func isRetryable(_ error: Error) -> Bool {
+        if case let XetDownloaderError.fetchFailed(statusCode, _) = error,
+            let code = statusCode
+        {
+            return code == 408 || code == 429 || code >= 500
         }
-        let decoded = try decodeXorbData(
-            responseData,
-            expectedUnpackedLength: expectedUnpackedLength
-        )
-        return FetchedXorb(
-            data: decoded.data,
-            chunkByteIndices: decoded.chunkByteIndices,
-            chunkRange: fetchInfo.range
-        )
+
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut, .networkConnectionLost, .notConnectedToInternet,
+                .cannotConnectToHost, .dnsLookupFailed,
+                .internationalRoamingOff, .dataNotAllowed:
+                return true
+            default:
+                return false
+            }
+        }
+
+        if let xorbError = error as? XorbError {
+            switch xorbError {
+            case .truncatedStream, .decompressionFailed, .lengthMismatch, .invalidLength:
+                return true
+            case .unsupportedVersion, .unsupportedCompressionScheme:
+                return false
+            }
+        }
+
+        return false
     }
 
     private func decodeXorbData(
