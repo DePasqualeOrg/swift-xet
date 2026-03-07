@@ -18,6 +18,23 @@ import NIOPosix
     import NIOTransportServices
 #endif
 
+/// Progress update for a single file download.
+///
+/// Progress callbacks are delivered sequentially in the order bytes are written.
+/// The handler is called on the same task context as the download method.
+/// To update UI, dispatch to the main actor within your handler.
+public struct DownloadProgress: Sendable, Equatable {
+    /// Total expected bytes (decompressed).
+    public let totalBytes: Int64
+    /// Bytes written so far (decompressed).
+    public let bytesWritten: Int64
+    /// Fraction completed (0.0 to 1.0), clamped.
+    public var fractionCompleted: Double {
+        guard totalBytes > 0 else { return 0 }
+        return min(1.0, Double(bytesWritten) / Double(totalBytes))
+    }
+}
+
 /// Namespace for Xet download helpers.
 ///
 /// Use ``withDownloader(refreshURL:hubToken:configuration:_:)``
@@ -257,9 +274,11 @@ public final class XetDownloader: @unchecked Sendable {
     ///   to write directly to disk instead.
     public func data(
         for fileID: String,
-        byteRange: Range<UInt64>? = nil
+        byteRange: Range<UInt64>? = nil,
+        progressHandler: (@Sendable (DownloadProgress) -> Void)? = nil
     ) async throws -> Data {
         if let byteRange, byteRange.isEmpty {
+            progressHandler?(DownloadProgress(totalBytes: 0, bytesWritten: 0))
             return Data()
         }
         let writer = DataOutputWriter()
@@ -267,7 +286,8 @@ public final class XetDownloader: @unchecked Sendable {
         _ = try await download(
             fileID: fileID,
             byteRange: byteRange,
-            target: target
+            target: target,
+            progressHandler: progressHandler
         )
         return await writer.data
     }
@@ -298,7 +318,8 @@ public final class XetDownloader: @unchecked Sendable {
         _ fileID: String,
         byteRange: Range<UInt64>? = nil,
         to destinationURL: URL,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        progressHandler: (@Sendable (DownloadProgress) -> Void)? = nil
     ) async throws -> Int64 {
         if fileManager.fileExists(atPath: destinationURL.path) {
             try fileManager.removeItem(at: destinationURL)
@@ -308,6 +329,7 @@ public final class XetDownloader: @unchecked Sendable {
         }
 
         if let byteRange, byteRange.isEmpty {
+            progressHandler?(DownloadProgress(totalBytes: 0, bytesWritten: 0))
             return 0
         }
         let writer = try FileOutputWriter(destinationURL: destinationURL)
@@ -316,7 +338,8 @@ public final class XetDownloader: @unchecked Sendable {
             let written = try await download(
                 fileID: fileID,
                 byteRange: byteRange,
-                target: target
+                target: target,
+                progressHandler: progressHandler
             )
             try await target.closeIfNeeded()
             return written
@@ -339,7 +362,24 @@ public final class XetDownloader: @unchecked Sendable {
         try await httpClientPool.shutdown()
     }
 
-    // MARK: -
+    // MARK: - Progress
+
+    /// Computes the total expected decompressed bytes for progress reporting.
+    static func totalExpectedBytes(
+        terms: [CASClient.ReconstructionResponse.Term],
+        offsetIntoFirstRange: UInt64,
+        maxBytesToWrite: UInt64?
+    ) -> Int64 {
+        let totalUnpacked = terms.reduce(Int64(0)) { $0 + Int64($1.unpackedLength) }
+        let adjustedUnpacked = max(0, totalUnpacked - Int64(offsetIntoFirstRange))
+        return if let maxBytesToWrite {
+            min(Int64(maxBytesToWrite), adjustedUnpacked)
+        } else {
+            adjustedUnpacked
+        }
+    }
+
+    // MARK: - Download
 
     /// Core download implementation that writes to any ``WriteTarget``.
     ///
@@ -349,7 +389,8 @@ public final class XetDownloader: @unchecked Sendable {
     private func download(
         fileID: String,
         byteRange: Range<UInt64>?,
-        target: WriteTarget
+        target: WriteTarget,
+        progressHandler: (@Sendable (DownloadProgress) -> Void)? = nil
     ) async throws -> Int64 {
         // Validate file ID
         guard fileID.count == 64,
@@ -429,6 +470,14 @@ public final class XetDownloader: @unchecked Sendable {
             )
         }
 
+        let totalExpectedBytes = Self.totalExpectedBytes(
+            terms: reconstruction.terms,
+            offsetIntoFirstRange: reconstruction.offsetIntoFirstRange,
+            maxBytesToWrite: maxBytesToWrite
+        )
+
+        progressHandler?(DownloadProgress(totalBytes: totalExpectedBytes, bytesWritten: 0))
+
         var chunkCache: [FetchRangeKey: FetchedXorb] = [:]
 
         var totalWritten: Int64 = 0
@@ -507,6 +556,7 @@ public final class XetDownloader: @unchecked Sendable {
             }
 
             totalWritten += Int64(upper - lower)
+            progressHandler?(DownloadProgress(totalBytes: totalExpectedBytes, bytesWritten: totalWritten))
         }
 
         func ensureFetchTask(for context: TermContext) {
@@ -572,6 +622,9 @@ public final class XetDownloader: @unchecked Sendable {
             let range = try termRange(from: fetchedChunks, for: term)
             try await writeTermData(base: fetchedChunks.data, range: range)
         }
+
+        // Guarantee a final completion callback.
+        progressHandler?(DownloadProgress(totalBytes: totalExpectedBytes, bytesWritten: totalWritten))
 
         return totalWritten
     }
