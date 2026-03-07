@@ -47,14 +47,10 @@ private func resolveXetFileID(
     return nil
 }
 
-@Suite(
-    "Integration Tests",
-    .enabled(if: ProcessInfo.processInfo.environment["HF_TOKEN"] != nil)
-)
+@Suite("Integration Tests")
 struct IntegrationTests {
     @Test func rangeDownload() async throws {
         let hubToken = ProcessInfo.processInfo.environment["HF_TOKEN"]
-        guard let hubToken else { return }
 
         let repoID = "xet-team/xet-spec-reference-files"
         let revision = "main"
@@ -92,7 +88,6 @@ struct IntegrationTests {
 
     @Test func downloadToFile() async throws {
         let hubToken = ProcessInfo.processInfo.environment["HF_TOKEN"]
-        guard let hubToken else { return }
 
         let repoID = "xet-team/xet-spec-reference-files"
         let revision = "main"
