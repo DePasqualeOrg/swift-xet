@@ -525,7 +525,11 @@ public final class XetDownloader: @unchecked Sendable {
                             )
                         }
                     )
-                    progressAggregator.removeFetchEstimate(key: key)
+                    // Keep the fetch estimate alive until the download loop
+                    // writes the term data and calls setWrittenBytes. Removing
+                    // it here would create a gap where the estimate is gone but
+                    // writtenBytes hasn't caught up, causing progress to stall
+                    // then jump when multiple xorbs complete concurrently.
                     await fetchSemaphore.signal()
                     return fetched
                 } catch {
@@ -567,6 +571,7 @@ public final class XetDownloader: @unchecked Sendable {
             }
             let range = try termRange(from: fetchedChunks, for: term)
             try await writeTermData(base: fetchedChunks.data, range: range)
+            progressAggregator.removeFetchEstimate(key: key)
         }
 
         // Guarantee a final completion callback.
