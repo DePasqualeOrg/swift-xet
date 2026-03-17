@@ -7,9 +7,9 @@ let package = Package(
     name: "Xet",
     platforms: [
         .macOS(.v13),
-        .iOS(.v15),
-        .tvOS(.v15),
-        .watchOS(.v8),
+        .iOS(.v16),
+        .tvOS(.v16),
+        .watchOS(.v9),
         .visionOS(.v1),
     ],
     products: [
