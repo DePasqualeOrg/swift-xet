@@ -4,7 +4,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "Xet",
+    name: "swift-xet",
     platforms: [
         .macOS(.v13),
         .iOS(.v16),
