@@ -53,6 +53,56 @@ struct DownloadProgressTests {
         #expect(a != c)
     }
 
+    @Test func emptyRangeAppendPreservesExistingFile() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let destination = directory.appendingPathComponent("partial.bin")
+        let existing = Data("partial".utf8)
+        try existing.write(to: destination)
+
+        let downloader = XetDownloader(
+            refreshURL: URL(string: "https://huggingface.co/api/models/test/repo/xet-read-token/main")!
+        )
+        defer { downloader.invalidate() }
+
+        let written = try await downloader.download(
+            String(repeating: "a", count: 64),
+            byteRange: UInt64(existing.count) ..< UInt64(existing.count),
+            to: destination,
+            appendingToExistingFile: true
+        )
+
+        #expect(written == 0)
+        #expect(try Data(contentsOf: destination) == existing)
+    }
+
+    @Test func appendRequiresDestinationSizeToMatchRangeStart() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let destination = directory.appendingPathComponent("partial.bin")
+        try Data("partial".utf8).write(to: destination)
+
+        let downloader = XetDownloader(
+            refreshURL: URL(string: "https://huggingface.co/api/models/test/repo/xet-read-token/main")!
+        )
+        defer { downloader.invalidate() }
+
+        await #expect(throws: XetDownloaderError.self) {
+            try await downloader.download(
+                String(repeating: "a", count: 64),
+                byteRange: 0 ..< 1,
+                to: destination,
+                appendingToExistingFile: true
+            )
+        }
+    }
+
     // MARK: - totalExpectedBytes (production code)
 
     @Test func totalExpectedBytesFullDownload() {

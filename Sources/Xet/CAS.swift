@@ -10,6 +10,7 @@ import Foundation
 /// that describes how to reassemble a file from its constituent chunks.
 struct CASClient: Sendable {
     private let urlSession: URLSession
+    private static let reconstructionVersionState = ReconstructionVersionState()
 
     /// Creates a CAS client with the specified URL session.
     init(urlSession: URLSession = .shared) {
@@ -36,34 +37,242 @@ struct CASClient: Sendable {
         of fileID: String,
         casURL: URL,
         accessToken: String,
-        byteRange: Range<UInt64>?
-    ) async throws -> ReconstructionResponse {
-        let url = casURL.appendingPathComponent("v1").appendingPathComponent("reconstructions")
+        requestHeaders: [String: String] = [:],
+        byteRange: Range<UInt64>?,
+        enableMultiRangeFetching: Bool = false,
+        maxRetries: Int = 5,
+        retryBaseDelay: TimeInterval = 3,
+        retryMaxDuration: TimeInterval = 360
+    ) async throws -> ReconstructionResponse? {
+        let detectedVersion = await Self.reconstructionVersionState.detectedVersion(for: casURL)
+        if detectedVersion == 1 {
+            return try await requestReconstruction(
+                of: fileID,
+                casURL: casURL,
+                accessToken: accessToken,
+                requestHeaders: requestHeaders,
+                byteRange: byteRange,
+                apiVersion: 1,
+                enableMultiRangeFetching: enableMultiRangeFetching,
+                maxRetries: maxRetries,
+                retryBaseDelay: retryBaseDelay,
+                retryMaxDuration: retryMaxDuration
+            )
+        }
+
+        do {
+            let response = try await requestReconstruction(
+                of: fileID,
+                casURL: casURL,
+                accessToken: accessToken,
+                requestHeaders: requestHeaders,
+                byteRange: byteRange,
+                apiVersion: 2,
+                enableMultiRangeFetching: enableMultiRangeFetching,
+                maxRetries: maxRetries,
+                retryBaseDelay: retryBaseDelay,
+                retryMaxDuration: retryMaxDuration
+            )
+            await Self.reconstructionVersionState.setDetectedVersion(2, for: casURL)
+            return response
+        } catch {
+            guard detectedVersion == nil, Self.shouldFallbackToV1(error) else {
+                throw error
+            }
+        }
+
+        let response = try await requestReconstruction(
+            of: fileID,
+            casURL: casURL,
+            accessToken: accessToken,
+            requestHeaders: requestHeaders,
+            byteRange: byteRange,
+            apiVersion: 1,
+            enableMultiRangeFetching: enableMultiRangeFetching,
+            maxRetries: maxRetries,
+            retryBaseDelay: retryBaseDelay,
+            retryMaxDuration: retryMaxDuration
+        )
+        await Self.reconstructionVersionState.setDetectedVersion(1, for: casURL)
+        return response
+    }
+
+    private func requestReconstruction(
+        of fileID: String,
+        casURL: URL,
+        accessToken: String,
+        requestHeaders: [String: String],
+        byteRange: Range<UInt64>?,
+        apiVersion: Int,
+        enableMultiRangeFetching: Bool,
+        maxRetries: Int,
+        retryBaseDelay: TimeInterval,
+        retryMaxDuration: TimeInterval
+    ) async throws -> ReconstructionResponse? {
+        let versionPath = "v\(apiVersion)"
+        let url = casURL.appendingPathComponent(versionPath).appendingPathComponent("reconstructions")
             .appendingPathComponent(fileID)
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        for (key, value) in requestHeaders where key.caseInsensitiveCompare("authorization") != .orderedSame {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         if let byteRange, !byteRange.isEmpty {
             request.setValue(byteRange.httpRangeHeaderValue, forHTTPHeaderField: "Range")
         }
 
-        let (data, response) = try await urlSession.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw XetDownloaderError.invalidReconstructionResponse
-        }
-        guard (200 ..< 300).contains(http.statusCode) else {
-            throw XetDownloaderError.reconstructionRequestFailed(
-                statusCode: http.statusCode,
-                body: data
-            )
+        return try await reconstructionWithRetry(
+            for: request,
+            apiVersion: apiVersion,
+            enableMultiRangeFetching: enableMultiRangeFetching,
+            maxRetries: maxRetries,
+            retryBaseDelay: retryBaseDelay,
+            retryMaxDuration: retryMaxDuration
+        )
+    }
+
+    private func reconstructionWithRetry(
+        for request: URLRequest,
+        apiVersion: Int,
+        enableMultiRangeFetching: Bool,
+        maxRetries: Int,
+        retryBaseDelay: TimeInterval,
+        retryMaxDuration: TimeInterval
+    ) async throws -> ReconstructionResponse? {
+        let maxAttempts = max(1, maxRetries + 1)
+        var delay = retryBaseDelay
+        let deadline = ContinuousClock.now + .seconds(retryMaxDuration)
+        var lastError: Error?
+
+        for attempt in 0 ..< maxAttempts {
+            if attempt > 0 {
+                let remaining = deadline - .now
+                if remaining <= .zero {
+                    break
+                }
+                let jittered = Duration.seconds(delay * Double.random(in: 0.0 ... 1.0))
+                try await Task.sleep(for: min(jittered, remaining))
+                delay *= 2
+            }
+
+            do {
+                let (data, response) = try await urlSession.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw XetDownloaderError.invalidReconstructionResponse
+                }
+                guard (200 ..< 300).contains(http.statusCode) else {
+                    if http.statusCode == 416 {
+                        return nil
+                    }
+                    throw XetDownloaderError.reconstructionRequestFailed(
+                        statusCode: http.statusCode,
+                        body: data
+                    )
+                }
+                return try decodeReconstruction(
+                    data,
+                    apiVersion: apiVersion,
+                    enableMultiRangeFetching: enableMultiRangeFetching
+                )
+            } catch {
+                guard Self.isRetryableReconstructionError(error) else {
+                    throw error
+                }
+                lastError = error
+            }
         }
 
+        throw lastError ?? XetDownloaderError.invalidReconstructionResponse
+    }
+
+    private func decodeReconstruction(
+        _ data: Data,
+        apiVersion: Int,
+        enableMultiRangeFetching: Bool
+    ) throws -> ReconstructionResponse {
         do {
+            if apiVersion == 2 {
+                let response = try JSONDecoder().decode(ReconstructionResponseV2.self, from: data)
+                return try response.asReconstructionResponse(enableMultiRangeFetching: enableMultiRangeFetching)
+            }
             return try JSONDecoder().decode(ReconstructionResponse.self, from: data)
         } catch {
             throw XetDownloaderError.reconstructionDecodingFailed(error)
         }
+    }
+
+    private static func shouldFallbackToV1(_ error: Error) -> Bool {
+        if case let XetDownloaderError.reconstructionRequestFailed(statusCode, _) = error {
+            return statusCode == 404 || statusCode == 501
+        }
+        return false
+    }
+
+    private static func isRetryableReconstructionError(_ error: Error) -> Bool {
+        if case let XetDownloaderError.reconstructionRequestFailed(statusCode, _) = error {
+            if statusCode == 501 {
+                return false
+            }
+            return statusCode == 408 || statusCode == 429 || statusCode >= 500
+        }
+
+        if case let XetDownloaderError.reconstructionDecodingFailed(error) = error {
+            return isLikelyTruncatedJSON(error)
+        }
+
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut, .networkConnectionLost, .notConnectedToInternet,
+                .cannotConnectToHost, .dnsLookupFailed,
+                .internationalRoamingOff, .dataNotAllowed,
+                .cannotParseResponse:
+                return true
+            default:
+                return false
+            }
+        }
+
+        return false
+    }
+
+    private static func isLikelyTruncatedJSON(_ error: Error) -> Bool {
+        guard let decodingError = error as? DecodingError else {
+            return false
+        }
+        let context: DecodingError.Context
+        switch decodingError {
+        case let .dataCorrupted(c):
+            context = c
+        case .keyNotFound, .typeMismatch, .valueNotFound:
+            // These indicate schema mismatches (well-formed JSON missing fields,
+            // wrong types). Retrying will not change the outcome.
+            return false
+        @unknown default:
+            return false
+        }
+
+        // Foundation's JSONDecoder wraps the JSONSerialization parse error in
+        // `context.underlyingError`. Truncated/malformed JSON surfaces as
+        // NSCocoaErrorDomain code 3840 (propertyListReadCorrupt).
+        if let underlying = context.underlyingError as NSError?,
+            underlying.domain == NSCocoaErrorDomain,
+            underlying.code == 3840
+        {
+            return true
+        }
+
+        // Fallback for platforms (notably swift-corelibs-foundation) where
+        // the underlying error may not be reported with the canonical code.
+        // Linux Foundation reports both truncated and malformed JSON with the
+        // generic "The given data was not valid JSON." message and no
+        // underlying error, so match that here as well.
+        let lowercased = context.debugDescription.lowercased()
+        return lowercased.contains("end of file")
+            || lowercased.contains("eof")
+            || lowercased.contains("unexpected end")
+            || lowercased.contains("not valid json")
     }
 
     /// Response from the CAS reconstruction API.
@@ -174,22 +383,55 @@ struct CASClient: Sendable {
             /// Presigned URL for downloading xorb data.
             let url: String
 
+            /// Chunk and byte ranges covered by this fetch.
+            let ranges: [RangeDescriptor]
+
             /// Half-open range of chunk indices covered by this fetch.
-            let range: Range<Int>
+            var range: Range<Int> {
+                let lower = ranges.first?.chunkRange.lowerBound ?? 0
+                let upper = ranges.last?.chunkRange.upperBound ?? lower
+                return lower ..< upper
+            }
 
             /// Closed byte range to request via HTTP `Range` header.
-            let urlRange: ClosedRange<UInt64>
+            var urlRange: ClosedRange<UInt64> {
+                ranges.first?.urlRange ?? 0 ... 0
+            }
+
+            /// Closed byte ranges to request via HTTP `Range` header.
+            var urlRanges: [ClosedRange<UInt64>] {
+                ranges.map(\.urlRange)
+            }
 
             /// Creates fetch info.
             init(url: String, range: Range<Int>, urlRange: ClosedRange<UInt64>) {
                 self.url = url
-                self.range = range
-                self.urlRange = urlRange
+                self.ranges = [
+                    RangeDescriptor(chunkRange: range, urlRange: urlRange)
+                ]
+            }
+
+            /// Creates fetch info from one or more range descriptors.
+            init(url: String, ranges: [RangeDescriptor]) {
+                precondition(!ranges.isEmpty)
+                self.url = url
+                self.ranges = ranges
+            }
+
+            /// Returns true when this fetch covers the entire term chunk range.
+            func contains(termRange: Range<Int>) -> Bool {
+                ranges.contains { descriptor in
+                    descriptor.chunkRange.lowerBound <= termRange.lowerBound
+                        && descriptor.chunkRange.upperBound >= termRange.upperBound
+                }
             }
 
             /// The HTTP `Range` header value for this fetch.
             var urlRangeHeaderValue: String {
-                "bytes=\(urlRange.lowerBound)-\(urlRange.upperBound)"
+                let ranges = urlRanges
+                    .map { "\($0.lowerBound)-\($0.upperBound)" }
+                    .joined(separator: ",")
+                return "bytes=\(ranges)"
             }
 
             private enum CodingKeys: String, CodingKey {
@@ -208,7 +450,6 @@ struct CASClient: Sendable {
                 )
                 let rangeStart = try rangeContainer.decode(Int.self, forKey: .start)
                 let rangeEnd = try rangeContainer.decode(Int.self, forKey: .end)
-                range = rangeStart ..< rangeEnd
 
                 let urlRangeContainer = try container.nestedContainer(
                     keyedBy: RangeCodingKeys.self,
@@ -216,7 +457,9 @@ struct CASClient: Sendable {
                 )
                 let urlStart = try urlRangeContainer.decode(UInt64.self, forKey: .start)
                 let urlEnd = try urlRangeContainer.decode(UInt64.self, forKey: .end)
-                urlRange = urlStart ... urlEnd
+                ranges = [
+                    RangeDescriptor(chunkRange: rangeStart ..< rangeEnd, urlRange: urlStart ... urlEnd)
+                ]
             }
 
             public func encode(to encoder: Encoder) throws {
@@ -238,6 +481,102 @@ struct CASClient: Sendable {
                 try urlRangeContainer.encode(urlRange.upperBound, forKey: .end)
             }
         }
+
+        /// Mapping from a chunk range to the corresponding xorb byte range.
+        struct RangeDescriptor: Sendable, Hashable {
+            let chunkRange: Range<Int>
+            let urlRange: ClosedRange<UInt64>
+        }
+    }
+
+    /// V2 response from the CAS reconstruction API.
+    private struct ReconstructionResponseV2: Decodable {
+        let offsetIntoFirstRange: UInt64
+        let terms: [ReconstructionResponse.Term]
+        let xorbs: [String: [XorbMultiRangeFetch]]
+
+        private enum CodingKeys: String, CodingKey {
+            case offsetIntoFirstRange = "offset_into_first_range"
+            case terms
+            case xorbs
+        }
+
+        func asReconstructionResponse(enableMultiRangeFetching: Bool) throws -> ReconstructionResponse {
+            var fetchInfo: [String: [ReconstructionResponse.FetchInfo]] = [:]
+            for (hash, fetches) in xorbs {
+                fetchInfo[hash] = try fetches.flatMap { fetch -> [ReconstructionResponse.FetchInfo] in
+                    guard !fetch.ranges.isEmpty else {
+                        throw XetDownloaderError.invalidReconstruction
+                    }
+                    if enableMultiRangeFetching {
+                        let descriptors = try fetch.ranges.map { try $0.asRangeDescriptor() }
+                        return [
+                            ReconstructionResponse.FetchInfo(url: fetch.url, ranges: descriptors)
+                        ]
+                    }
+
+                    return try fetch.ranges.map { range in
+                        let descriptor = try range.asRangeDescriptor()
+                        return ReconstructionResponse.FetchInfo(
+                            url: fetch.url,
+                            range: descriptor.chunkRange,
+                            urlRange: descriptor.urlRange
+                        )
+                    }
+                }
+            }
+
+            return ReconstructionResponse(
+                offsetIntoFirstRange: offsetIntoFirstRange,
+                terms: terms,
+                fetchInfo: fetchInfo
+            )
+        }
+
+        struct XorbMultiRangeFetch: Decodable {
+            let url: String
+            let ranges: [XorbRangeDescriptor]
+        }
+
+        struct XorbRangeDescriptor: Decodable {
+            let chunks: ChunkRange
+            let bytes: ByteRange
+
+            func asRangeDescriptor() throws -> ReconstructionResponse.RangeDescriptor {
+                guard chunks.end >= chunks.start else {
+                    throw XetDownloaderError.invalidReconstruction
+                }
+                guard bytes.end >= bytes.start else {
+                    throw XetDownloaderError.invalidReconstruction
+                }
+                return ReconstructionResponse.RangeDescriptor(
+                    chunkRange: chunks.start ..< chunks.end,
+                    urlRange: bytes.start ... bytes.end
+                )
+            }
+        }
+
+        struct ChunkRange: Decodable {
+            let start: Int
+            let end: Int
+        }
+
+        struct ByteRange: Decodable {
+            let start: UInt64
+            let end: UInt64
+        }
+    }
+}
+
+private actor ReconstructionVersionState {
+    private var versionsByEndpoint: [URL: Int] = [:]
+
+    func detectedVersion(for endpoint: URL) -> Int? {
+        versionsByEndpoint[endpoint]
+    }
+
+    func setDetectedVersion(_ version: Int, for endpoint: URL) {
+        versionsByEndpoint[endpoint] = version
     }
 }
 
