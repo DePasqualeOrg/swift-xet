@@ -155,14 +155,14 @@ struct RetryTests {
 
     @Test func defaultRetryConfiguration() {
         let config = XetDownloader.Configuration.default
-        #expect(config.maxRetryAttempts == 5)
+        #expect(config.maxRetries == 5)
         #expect(config.retryBaseDelay == 3)
         #expect(config.retryMaxDuration == 360)
     }
 
-    @Test func retryDisabledWithOneAttempt() {
+    @Test func retryDisabledWithZeroRetries() {
         var config = XetDownloader.Configuration.default
-        config.maxRetryAttempts = 1
-        #expect(config.maxRetryAttempts == 1)
+        config.maxRetries = 0
+        #expect(config.maxRetries == 0)
     }
 }

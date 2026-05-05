@@ -1,12 +1,60 @@
 import Foundation
+#if canImport(FoundationNetworking)
+    import FoundationNetworking
+#endif
 import Testing
 
 @testable import Xet
 
 typealias ReconstructionResponse = CASClient.ReconstructionResponse
 
-@Suite("CAS Tests")
+private final class CASMockURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+    nonisolated(unsafe) static var requests: [URLRequest] = []
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        do {
+            Self.requests.append(request)
+            let (response, data) = try Self.handler?(request) ?? {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 500,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+                return (response, Data())
+            }()
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+@Suite("CAS Tests", .serialized)
 struct CASTests {
+    private func makeClient() -> CASClient {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CASMockURLProtocol.self]
+        return CASClient(urlSession: URLSession(configuration: configuration))
+    }
+
+    private func resetMock() {
+        CASMockURLProtocol.handler = nil
+        CASMockURLProtocol.requests = []
+    }
 
     // MARK: - ReconstructionResponse Codable
 
@@ -219,5 +267,225 @@ struct CASTests {
         #expect(term.range.isEmpty)
         #expect(term.range.lowerBound == 5)
         #expect(term.range.upperBound == 5)
+    }
+
+    // MARK: - CAS API behavior
+
+    @Test func reconstructionUsesV2ResponseShape() async throws {
+        resetMock()
+        defer { resetMock() }
+
+        CASMockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            let body = Data(
+                """
+                {
+                    "offset_into_first_range": 0,
+                    "terms": [
+                        {
+                            "hash": "xorbhash",
+                            "unpacked_length": 1024,
+                            "range": {"start": 0, "end": 2}
+                        }
+                    ],
+                    "xorbs": {
+                        "xorbhash": [
+                            {
+                                "url": "https://cdn.example/xorb",
+                                "ranges": [
+                                    {
+                                        "chunks": {"start": 0, "end": 2},
+                                        "bytes": {"start": 10, "end": 99}
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+                """.utf8
+            )
+            return (response, body)
+        }
+
+        let optionalResponse = try await makeClient().reconstruction(
+            of: String(repeating: "a", count: 64),
+            casURL: URL(string: "https://cas-v2.example")!,
+            accessToken: "token",
+            requestHeaders: ["User-Agent": "swift-xet-test"],
+            byteRange: 5 ..< 10,
+            maxRetries: 0
+        )
+        let response = try #require(optionalResponse)
+
+        #expect(CASMockURLProtocol.requests.count == 1)
+        #expect(CASMockURLProtocol.requests[0].url?.path == "/v2/reconstructions/\(String(repeating: "a", count: 64))")
+        #expect(CASMockURLProtocol.requests[0].value(forHTTPHeaderField: "Range") == "bytes=5-9")
+        #expect(CASMockURLProtocol.requests[0].value(forHTTPHeaderField: "Authorization") == "Bearer token")
+        #expect(CASMockURLProtocol.requests[0].value(forHTTPHeaderField: "User-Agent") == "swift-xet-test")
+        #expect(response.fetchInfo["xorbhash"]?.first?.urlRangeHeaderValue == "bytes=10-99")
+    }
+
+    @Test func reconstructionFallsBackToV1WhenV2Unavailable() async throws {
+        resetMock()
+        defer { resetMock() }
+
+        CASMockURLProtocol.handler = { request in
+            if request.url?.path.contains("/v2/") == true {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 501,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+                return (response, Data())
+            }
+
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            let body = Data(
+                """
+                {
+                    "offset_into_first_range": 0,
+                    "terms": [],
+                    "fetch_info": {}
+                }
+                """.utf8
+            )
+            return (response, body)
+        }
+
+        _ = try await makeClient().reconstruction(
+            of: String(repeating: "b", count: 64),
+            casURL: URL(string: "https://cas-v1-fallback.example")!,
+            accessToken: "token",
+            byteRange: nil,
+            maxRetries: 2
+        )
+
+        #expect(CASMockURLProtocol.requests.map { $0.url?.path }.compactMap { $0 } == [
+            "/v2/reconstructions/\(String(repeating: "b", count: 64))",
+            "/v1/reconstructions/\(String(repeating: "b", count: 64))",
+        ])
+    }
+
+    @Test func reconstructionRetriesTransientCASFailures() async throws {
+        resetMock()
+        defer { resetMock() }
+
+        CASMockURLProtocol.handler = { request in
+            if CASMockURLProtocol.requests.count == 1 {
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 503,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+                return (response, Data())
+            }
+
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            let body = Data(
+                """
+                {
+                    "offset_into_first_range": 0,
+                    "terms": [],
+                    "xorbs": {}
+                }
+                """.utf8
+            )
+            return (response, body)
+        }
+
+        _ = try await makeClient().reconstruction(
+            of: String(repeating: "c", count: 64),
+            casURL: URL(string: "https://cas-retry.example")!,
+            accessToken: "token",
+            byteRange: nil,
+            maxRetries: 1,
+            retryBaseDelay: 0
+        )
+
+        #expect(CASMockURLProtocol.requests.count == 2)
+    }
+
+    @Test func reconstructionRetriesTruncatedJSONBodies() async throws {
+        resetMock()
+        defer { resetMock() }
+
+        CASMockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+
+            if CASMockURLProtocol.requests.count == 1 {
+                return (response, Data(#"{"offset_into_first_range":"#.utf8))
+            }
+
+            let body = Data(
+                """
+                {
+                    "offset_into_first_range": 0,
+                    "terms": [],
+                    "xorbs": {}
+                }
+                """.utf8
+            )
+            return (response, body)
+        }
+
+        _ = try await makeClient().reconstruction(
+            of: String(repeating: "e", count: 64),
+            casURL: URL(string: "https://cas-json-retry.example")!,
+            accessToken: "token",
+            byteRange: nil,
+            maxRetries: 1,
+            retryBaseDelay: 0
+        )
+
+        #expect(CASMockURLProtocol.requests.count == 2)
+    }
+
+    @Test func reconstructionReturnsNilForExpected416() async throws {
+        resetMock()
+        defer { resetMock() }
+
+        CASMockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 416,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, Data())
+        }
+
+        let response = try await makeClient().reconstruction(
+            of: String(repeating: "d", count: 64),
+            casURL: URL(string: "https://cas-range-eof.example")!,
+            accessToken: "token",
+            byteRange: 100 ..< 200,
+            maxRetries: 1,
+            retryBaseDelay: 0
+        )
+
+        #expect(response == nil)
+        #expect(CASMockURLProtocol.requests.count == 1)
     }
 }
